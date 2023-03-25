@@ -28,6 +28,7 @@ async fn main() {
         match user_input.as_str() {
             "1" => create_offer(&client).await,
             "2" => show_offers(&client).await,
+            "3" => take_offer(&client).await,
             _ => println!("Invalid input. Please input a number."),
         }
 
@@ -160,3 +161,42 @@ async fn show_offers(client: &Client) {
         println!("{:?}", event.as_json());
     }
 }
+
+// Take Offer (Send Order)
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OrderContent {
+    offer_id: String,
+    quantity: u64, // in sats
+    price: i64, // in sats / dollar
+}
+
+async fn send_order(pubkey_string: String, offer_id: String, quantity: u64, price: i64, client: &Client) {
+    let pubkey = XOnlyPublicKey::from_str(pubkey_string.as_str()).unwrap();
+
+    let order_content = OrderContent { offer_id, quantity, price };
+    let order_content_string = serde_json::to_string(&order_content).unwrap();
+
+    client.send_direct_msg(pubkey, order_content_string).await.unwrap();
+}
+
+async fn take_offer(client: &Client) {
+    println!("What Offer ID?");
+    let offer_id = get_user_input();
+    println!("What Pubkey?");
+    let pubkey = get_user_input();
+    println!("How many Sats?");
+    let quantity = get_quantity();
+    println!("At what price?");
+    let price = get_price();
+    send_order(pubkey, offer_id, quantity, price, client).await;
+}
+
+// Respond to Order
+
+// async fn respond_to_order(client: &Client) {
+    // pubkey
+    // order-id
+    // Yes or No (with reason, basically if the Offer existed)
+    // send DM
+// }
