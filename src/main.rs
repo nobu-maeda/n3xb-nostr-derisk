@@ -1,6 +1,9 @@
+use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::string::{String,ToString};
+use std::sync::{Arc,Mutex};
+use std::thread;
 use std::time::Duration;
 use strum_macros::Display;
 use nostr_sdk::prelude::*;
@@ -8,9 +11,19 @@ use nostr_sdk::prelude::*;
 const APP_SPEC_KIND_SUFFIX: u16 = 30078;
 const APP_SPEC_D_TAG: &str = "n3x";
 
+type ArcClient = Arc<Mutex<Client>>;
+
 #[tokio::main]
 async fn main() {
-    let client = init_nostr_client().await;
+    let my_keys: Keys = Keys::generate();
+    let listen_client = init_nostr_client(&my_keys).await;
+    let client = init_nostr_client(&my_keys).await;
+    start_notification_listening(&listen_client).await;
+
+    let thread_client = listen_client.clone();
+    let handle = thread::spawn(move || {
+        block_on(perform_notification_handling(&thread_client));
+    });
 
     println!("n3x Nostr Derisk CLI");
 
@@ -34,18 +47,18 @@ async fn main() {
 
         println!("");
     }
+    handle.join().unwrap();
 }
 
 // Common Util
 
-async fn init_nostr_client() -> Client {
-    let my_keys: Keys = Keys::generate();
+async fn init_nostr_client(keys: &Keys) -> ArcClient {
     let opts = Options::new().wait_for_connection(true).wait_for_send(true).difficulty(8);
-    let client = Client::new_with_opts(&my_keys, opts);
+    let client = Client::new_with_opts(&keys, opts);
 
     client.add_relay("ws://localhost:8008", None).await.unwrap();
     client.connect().await;
-    client
+    Arc::new(Mutex::new(client))
 }
 
 fn get_user_input() -> String {
@@ -55,6 +68,54 @@ fn get_user_input() -> String {
 
     input.truncate(input.len() - 1);
     input
+}
+
+// Notifications
+
+async fn start_notification_listening(client: &ArcClient) {
+    // Offer subscription
+    let mut custom_tag_filter = Map::new();
+    custom_tag_filter.insert("#d".to_string(), Value::Array(vec![Value::String(APP_SPEC_D_TAG.to_string())]));
+
+    let offer_subscription = Filter::new()
+        .since(Timestamp::now())
+        .kind(Kind::ParameterizedReplaceable(APP_SPEC_KIND_SUFFIX))
+        .custom(custom_tag_filter);
+
+    // Order subscription
+    let order_subscription = Filter::new()
+    .since(Timestamp::now())
+    .pubkey(client.lock().unwrap().keys().public_key());
+
+    // Confirmation subscription
+
+    let filters = vec![offer_subscription, order_subscription];
+    client.lock().unwrap().subscribe(filters).await;
+}
+
+
+async fn perform_notification_handling(client: &ArcClient) {
+    client.lock().unwrap().handle_notifications(|notification| {
+        match notification {
+            RelayPoolNotification::Event(url, event) => {
+                println!("Got Event Notification");
+                println!("URL: {}", url.as_str());
+                println!("Event: {}", event.as_json());
+                println!();
+            },
+            RelayPoolNotification::Message(_, _) => {
+                // println!("Got Message Notification");
+                // println!("URL: {}", url.as_str());
+                // println!("Message: {}", message.as_json());
+                // println!();
+            },
+            RelayPoolNotification::Shutdown => {
+                println!("Got Shutdown Notification");
+                println!();
+            },
+        };
+        Ok(())
+    }).await.unwrap();
 }
 
 // Create Offer
@@ -113,7 +174,7 @@ fn get_price() -> i64 {
     }
 }
 
-async fn send_offer(offer_dir: OfferDirection, quantity: u64, price: i64, client: &Client) {
+async fn send_offer(offer_dir: OfferDirection, quantity: u64, price: i64, client: &ArcClient) {
     let app_tag: Tag = Tag::Generic(TagKind::Custom("d".to_string()), vec![APP_SPEC_D_TAG.to_string()]);
     let dir_tag: Tag = Tag::Generic(TagKind::Custom("x".to_string()), vec![offer_dir.to_string()]);
     let event_tags = [app_tag, dir_tag];
@@ -121,11 +182,12 @@ async fn send_offer(offer_dir: OfferDirection, quantity: u64, price: i64, client
     let offer_content = OfferContent { quantity, price };
     let offer_content_string = serde_json::to_string(&offer_content).unwrap();
 
+    let my_keys = client.lock().unwrap().keys();
     let builder = EventBuilder::new(Kind::ParameterizedReplaceable(APP_SPEC_KIND_SUFFIX), offer_content_string, &event_tags);
-    client.send_event(builder.to_event(&client.keys()).unwrap()).await.unwrap();
+    client.lock().unwrap().send_event(builder.to_event(&my_keys).unwrap()).await.unwrap();
 }
 
-async fn create_offer(client: &Client) {
+async fn create_offer(client: &ArcClient) {
     println!("Are you Buying or Selling?");
     let offer_dir = get_offer_dir();
     println!("How many Sats?");
@@ -137,7 +199,7 @@ async fn create_offer(client: &Client) {
 
 // Show Outstanding Offers
 
-async fn show_offers(client: &Client) {
+async fn show_offers(client: &ArcClient) {
     println!("Are you trying to see Buy Offers, or Sell Offers?");
     let offer_dir = get_offer_dir();
 
@@ -147,12 +209,11 @@ async fn show_offers(client: &Client) {
     custom_tag_filter.insert("#x".to_string(), Value::Array(vec![Value::String(offer_dir.to_string())]));
 
     let subscription = Filter::new()
-        //  .since(Timestamp::now())
          .kind(Kind::ParameterizedReplaceable(APP_SPEC_KIND_SUFFIX))
          .custom(custom_tag_filter);
     
      let timeout = Duration::from_secs(1);
-     let events = client
+     let events = client.lock().unwrap()
          .get_events_of(vec![subscription], Some(timeout))
          .await.unwrap();
 
@@ -171,16 +232,16 @@ struct OrderContent {
     price: i64, // in sats / dollar
 }
 
-async fn send_order(pubkey_string: String, offer_id: String, quantity: u64, price: i64, client: &Client) {
+async fn send_order(pubkey_string: String, offer_id: String, quantity: u64, price: i64, client: &ArcClient) {
     let pubkey = XOnlyPublicKey::from_str(pubkey_string.as_str()).unwrap();
 
     let order_content = OrderContent { offer_id, quantity, price };
     let order_content_string = serde_json::to_string(&order_content).unwrap();
 
-    client.send_direct_msg(pubkey, order_content_string).await.unwrap();
+    client.lock().unwrap().send_direct_msg(pubkey, order_content_string).await.unwrap();
 }
 
-async fn take_offer(client: &Client) {
+async fn take_offer(client: &ArcClient) {
     println!("What Offer ID?");
     let offer_id = get_user_input();
     println!("What Pubkey?");
